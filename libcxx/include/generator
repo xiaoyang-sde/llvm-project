@@ -1,0 +1,29 @@
+// -*- C++ -*-
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef _LIBCPP_GENERATOR
+#define _LIBCPP_GENERATOR
+
+#include <__config>
+
+#if _LIBCPP_STD_VER >= 23
+
+#include <__ranges/elements_of.h>
+
+_LIBCPP_BEGIN_NAMESPACE_STD
+
+_LIBCPP_END_NAMESPACE_STD
+
+#endif
+
+#if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
+#  pragma GCC system_header
+#endif
+
+#endif
