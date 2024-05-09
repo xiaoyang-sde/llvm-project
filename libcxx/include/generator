@@ -11,12 +11,84 @@
 #define _LIBCPP_GENERATOR
 
 #include <__config>
+#include <__coroutine/coroutine_handle.h>
+#include <__iterator/default_sentinel.h>
+#include <__ranges/elements_of.h>
+#include <__ranges/view_interface.h>
+#include <__type_traits/conditional.h>
+#include <__type_traits/is_nothrow_constructible.h>
+#include <__type_traits/is_reference.h>
+#include <__type_traits/is_void.h>
+#include <__type_traits/remove_cvref.h>
+#include <__utility/exchange.h>
+#include <__utility/swap.h>
 
 #if _LIBCPP_STD_VER >= 23
 
-#include <__ranges/elements_of.h>
-
 _LIBCPP_BEGIN_NAMESPACE_STD
+
+template <class _Ref, class _Val = void, class _Allocator = void>
+class generator : public ranges::view_interface<generator<_Ref, _Val, _Allocator>> {
+private:
+  using __value_t = conditional_t<is_void_v<_Val>, remove_cvref_t<_Ref>, _Val>;
+
+  using __reference_t = conditional_t<is_void_v<_Val>, _Ref&&, _Ref>;
+
+  class __iterator;
+
+public:
+  using yielded = conditional_t<is_reference_v<__reference_t>, __reference_t, const __reference_t&>;
+
+  class promise_type;
+
+  _LIBCPP_HIDE_FROM_ABI generator(const generator&) = delete;
+  _LIBCPP_HIDE_FROM_ABI generator(generator&& __other) noexcept
+      : __coroutine_(std::exchange(__other.__coroutine_, {})) {}
+
+  _LIBCPP_HIDE_FROM_ABI ~generator() {
+    if (__coroutine_) {
+      __coroutine_.destroy();
+    }
+  }
+
+  _LIBCPP_HIDE_FROM_ABI generator& operator=(generator __other) noexcept {
+    std::swap(__coroutine_, __other.__coroutine_);
+    return *this;
+  }
+
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __iterator begin() { __coroutine_.resume(); }
+
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI default_sentinel_t end() const noexcept { return default_sentinel; }
+
+private:
+  coroutine_handle<promise_type> __coroutine_ = nullptr;
+};
+
+template <class _Ref, class _Val, class _Allocator>
+class generator<_Ref, _Val, _Allocator>::__iterator {
+public:
+  using value_type      = __value_t;
+  using difference_type = ptrdiff_t;
+
+  __iterator(__iterator&& __other) noexcept : __coroutine_(std::exchange(__other.__coroutine_, {})) {}
+
+  __iterator& operator=(__iterator&& __other) noexcept {
+    __coroutine_ = std::exchange(__other.__coroutine_, {});
+    return *this;
+  }
+
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __reference_t operator*() const
+      noexcept(is_nothrow_copy_constructible_v<__reference_t>);
+
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __iterator& operator++();
+
+  _LIBCPP_HIDE_FROM_ABI void operator++(int) { ++*this; }
+
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI bool operator==(default_sentinel_t) { return __coroutine_.done(); }
+
+private:
+  coroutine_handle<promise_type> __coroutine_;
+};
 
 _LIBCPP_END_NAMESPACE_STD
 
