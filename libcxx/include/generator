@@ -10,9 +10,11 @@
 #ifndef _LIBCPP_GENERATOR
 #define _LIBCPP_GENERATOR
 
+#include <__concepts/constructible.h>
 #include <__config>
 #include <__coroutine/coroutine_handle.h>
 #include <__iterator/default_sentinel.h>
+#include <__memory/allocator_traits.h>
 #include <__ranges/elements_of.h>
 #include <__ranges/view_interface.h>
 #include <__type_traits/conditional.h>
@@ -26,6 +28,24 @@
 #if _LIBCPP_STD_VER >= 23
 
 _LIBCPP_BEGIN_NAMESPACE_STD
+
+struct alignas(__STDCPP_DEFAULT_NEW_ALIGNMENT__) __aligned_block {
+  unsigned char data[__STDCPP_DEFAULT_NEW_ALIGNMENT__];
+};
+
+template <class _Allocator = void>
+class __coroutine_allocator {
+private:
+  using __alloc_t = __rebind_alloc<_Allocator, __aligned_block>::type;
+
+  static void* __allocate(__alloc_t __allocator, const size_t __size) {
+    if constexpr (default_initializable<__alloc_t> && allocator_traits<__alloc_t>::is_always_equal::value) {
+      
+    }
+  }
+
+public:
+};
 
 template <class _Ref, class _Val = void, class _Allocator = void>
 class generator : public ranges::view_interface<generator<_Ref, _Val, _Allocator>> {
