@@ -13,10 +13,14 @@
 #include <__concepts/constructible.h>
 #include <__config>
 #include <__coroutine/coroutine_handle.h>
+#include <__coroutine/trivial_awaitables.h>
+#include <__exception/exception_ptr.h>
 #include <__iterator/default_sentinel.h>
+#include <__memory/addressof.h>
 #include <__memory/allocator_traits.h>
 #include <__ranges/elements_of.h>
 #include <__ranges/view_interface.h>
+#include <__type_traits/add_pointer.h>
 #include <__type_traits/conditional.h>
 #include <__type_traits/is_nothrow_constructible.h>
 #include <__type_traits/is_reference.h>
@@ -24,6 +28,9 @@
 #include <__type_traits/remove_cvref.h>
 #include <__utility/exchange.h>
 #include <__utility/swap.h>
+#include <coroutine>
+#include <exception>
+#include <variant>
 
 #if _LIBCPP_STD_VER >= 23
 
@@ -40,24 +47,255 @@ private:
 
   static void* __allocate(__alloc_t __allocator, const size_t __size) {
     if constexpr (default_initializable<__alloc_t> && allocator_traits<__alloc_t>::is_always_equal::value) {
-      
     }
   }
 
 public:
 };
 
+template <class _Ref, class _Val>
+using __gen_val = conditional_t<is_void_v<_Val>, remove_cvref_t<_Ref>, _Val>;
+
+template <class _Ref, class _Val>
+using __gen_ref = conditional_t<is_void_v<_Val>, _Ref&&, _Ref>;
+
+template <class _Ref, class _Val>
+using __gen_yielded =
+    conditional_t<is_reference_v<__gen_ref<_Ref, _Val>>, __gen_ref<_Ref, _Val>, const __gen_ref<_Ref, _Val>&>;
+
+template <class, class, class>
+class generator;
+
+template <class _Yielded>
+class __gen_promise_base {
+private:
+  // todo(delete me): root <-> nested <-> nested
+  // outmost gen yield nested gen yield nested gen
+  // outmost gen promise should know inner-most gen, so ++iter can resume the inner-most gen directly
+  // inner-most gen should know parent gen, so it can resume parent gen when it final_await
+  // inner-most gen should know root gen, so it can resume root gen when it yield_value, because *iter access the
+  // inner-most gen
+
+  // root: value, active
+  // nested: parent, bottom, exception
+
+  struct __promise_data;
+
+  class __root_frame {
+    add_pointer_t<_Yielded> __value_ptr_ = nullptr;
+    std::coroutine_handle<__gen_promise_base> __active_coroutine_ =
+        coroutine_handle<__gen_promise_base>::from_promise(*this);
+  };
+
+  class __nested_frame {
+    std::coroutine_handle<__gen_promise_base> __parent_coroutine_;
+    std::coroutine_handle<__gen_promise_base> __root_coroutine_;
+    std::exception_ptr __exception_;
+  };
+
+  std::variant<__root_frame, __nested_frame> __frame_state_;
+
+  __root_frame* __get_root_frame() { return std::get_if<__root_frame>(__frame_state_); }
+
+  __nested_frame* __get_nested_frame() { return std::get_if<__nested_frame>(__frame_state_); }
+  void __set_nested_frame() { __frame_state_ = __nested_frame{}; }
+
+  class __element_awaiter {
+  public:
+    [[nodiscard]] constexpr bool await_ready() const noexcept { return false; }
+
+    template <class _Promise>
+    constexpr void await_suspend(coroutine_handle<_Promise> __handle) noexcept {
+      __handle.promise().__value_ptr_ = std::addressof(__value_);
+    }
+
+    constexpr void await_resume() const noexcept {}
+
+  private:
+    remove_cvref_t<_Yielded> __value_;
+  };
+
+  class __final_awaiter {
+  public:
+    [[nodiscard]] constexpr bool await_ready() const noexcept { return false; }
+
+    template <class _Promise>
+    constexpr coroutine_handle<> await_suspend(coroutine_handle<_Promise> __handle) noexcept {
+      if (auto __nested_frame = __handle.promise().__get_nested_frame()) {
+        auto __parent_coroutine          = __nested_frame.__parent_coroutine_;
+        auto __root_frame                = __nested_frame.__root_coroutine_.promise().__get_root_frame();
+        __root_frame.__active_coroutine_ = __parent_coroutine;
+        return __parent_coroutine;
+      }
+      return std::noop_coroutine();
+    }
+
+    constexpr void await_resume() const noexcept {}
+  };
+
+  template <class _Ref, class _Val, class _Allocator>
+  class __nested_awaiter {
+  private:
+    generator<_Ref, _Val, _Allocator> __gen_;
+
+  public:
+    explicit __nested_awaiter(generator<_Ref, _Val, _Allocator>&& __gen) noexcept : __gen_(std::move(__gen)) {}
+
+    [[nodiscard]] constexpr bool await_ready() const noexcept { return !__gen_.__coroutine_; }
+
+    template <class _Promise>
+    constexpr coroutine_handle<__gen_promise_base> await_suspend(coroutine_handle<_Promise> __current) noexcept {
+      auto __nested = coroutine_handle<__gen_promise_base>::from_address(__gen_.__coroutine_.address());
+      __nested.__set_nested_frame();
+
+      auto __nested_frame                = __nested.promise().__get_nested_frame();
+      __nested_frame.__parent_coroutine_ = coroutine_handle<__gen_promise_base>::from_address(__current.address());
+      if (auto __parent_nested_frame = __nested_frame.__parent_coroutine_.promise().__get_nested_frame()) {
+        __nested_frame.__root_coroutine_ = __parent_nested_frame.__root_coroutine_;
+      } else {
+        __nested_frame.__root_coroutine_ = __nested_frame.__parent_coroutine_;
+      }
+
+      auto __root_frame                = __nested_frame.__root_coroutine_.promise().__get_root_frame();
+      __root_frame.__active_coroutine_ = __nested;
+
+      return __nested;
+    }
+
+    void await_resume() {
+      auto __nested       = coroutine_handle<__gen_promise_base>::from_address(__gen_.__coroutine_.address());
+      auto __nested_frame = __nested.promise().__get_nested_frame();
+      if (__nested_frame.__exception_) {
+        std::rethrow_exception(std::move(__nested_frame.__exception_));
+      }
+    }
+  };
+
+public:
+  suspend_always initial_suspend() const noexcept { return {}; }
+
+  auto final_suspend() noexcept { return __final_awaiter{}; }
+
+  suspend_always yield_value(_Yielded __val) noexcept {
+    std::get_if<__root_frame>(__frame_state_)->__value_ptr = addressof(__val);
+    return {};
+  }
+
+  auto yield_value(const remove_reference_t<_Yielded>& __val)
+    requires is_rvalue_reference_v<_Yielded> &&
+             constructible_from<remove_cvref_t<_Yielded>, const remove_reference_t<_Yielded>&>
+  {
+    return __element_awaiter(__val);
+  }
+
+  void await_transform() = delete;
+
+  void return_void() const noexcept {}
+
+  void unhandled_exception() {
+    if (auto __nested_frame = __get_nested_frame()) {
+      __nested_frame.exception_ptr = std::current_exception();
+    } else {
+      throw;
+    }
+  }
+};
+
+template <class _Yielded>
+struct __gen_promise_base<_Yielded>::__promise_data {
+  using __value_ptr_t = add_pointer_t<_Yielded>;
+
+  struct __root_data {
+    __value_ptr_t __value_ptr;
+    std::coroutine_handle<__gen_promise_base> __active;
+  };
+
+  struct __recursive_data {
+    std::exception_ptr __exception;
+    std::coroutine_handle<__gen_promise_base> __parent;
+    std::coroutine_handle<__gen_promise_base> __root;
+  };
+
+  union {
+    __root_data __root;
+    __recursive_data __recursive;
+  } __data;
+  bool __tag = false;
+
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI bool __is_root() noexcept { return !__tag; }
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI bool __is_recursive() noexcept { return __tag; }
+
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __root_data* __get_root_data() noexcept {
+    // assert(__is_root());
+    return __data.__root;
+  }
+
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __root_data* __get_recursive_data() noexcept {
+    // assert(__is_recursive());
+    return __data.__recursive;
+  }
+
+  // [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __value_ptr_t& __value_ptr() noexcept {
+  //   return __data.__root.__value_ptr;
+  // }
+
+  // [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __value_ptr_t& __root_value_ptr() noexcept {
+  //   if (__is_root()) {
+
+  //   }
+  //   return __data.__recursive.__root.promise().__data.__root.__value_ptr;
+  // }
+};
+
+template <class _Ref, class _Val>
+class __gen_iter {
+private:
+  using __val = __gen_val<_Ref, _Val>;
+  using __ref = __gen_ref<_Ref, _Val>;
+
+public:
+  using value_type      = __val;
+  using difference_type = ptrdiff_t;
+
+  struct promise_type {};
+
+  __gen_iter(__gen_iter&& __other) noexcept : __coroutine_(std::exchange(__other.__coroutine_, {})) {}
+
+  __gen_iter& operator=(__gen_iter&& __other) noexcept {
+    __coroutine_ = std::exchange(__other.__coroutine_, {});
+    return *this;
+  }
+
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __ref operator*() const noexcept(is_nothrow_copy_constructible_v<__ref>) {
+    // todo: return static_cast<__reference_t>();
+  }
+
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __gen_iter& operator++() {
+    // todo
+  }
+
+  _LIBCPP_HIDE_FROM_ABI void operator++(int) { ++*this; }
+
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI bool operator==(default_sentinel_t) { return __coroutine_.done(); }
+
+private:
+  _LIBCPP_HIDE_FROM_ABI explicit __gen_iter(coroutine_handle<promise_type> __coroutine) noexcept
+      : __coroutine_(std::move(__coroutine)) {}
+
+  coroutine_handle<promise_type> __coroutine_;
+};
+
 template <class _Ref, class _Val = void, class _Allocator = void>
 class generator : public ranges::view_interface<generator<_Ref, _Val, _Allocator>> {
 private:
-  using __value_t = conditional_t<is_void_v<_Val>, remove_cvref_t<_Ref>, _Val>;
+  using __val = __gen_val<_Ref, _Val>;
 
-  using __reference_t = conditional_t<is_void_v<_Val>, _Ref&&, _Ref>;
+  using __ref = __gen_ref<_Ref, _Val>;
 
-  class __iterator;
+  friend __gen_iter<_Ref, _Val>;
 
 public:
-  using yielded = conditional_t<is_reference_v<__reference_t>, __reference_t, const __reference_t&>;
+  using yielded = __gen_yielded<_Ref, _Val>;
 
   class promise_type;
 
@@ -76,38 +314,15 @@ public:
     return *this;
   }
 
-  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __iterator begin() { __coroutine_.resume(); }
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __gen_iter<_Ref, _Val> begin() {
+    __coroutine_.resume();
+    return __gen_iter(__coroutine_);
+  }
 
   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI default_sentinel_t end() const noexcept { return default_sentinel; }
 
 private:
   coroutine_handle<promise_type> __coroutine_ = nullptr;
-};
-
-template <class _Ref, class _Val, class _Allocator>
-class generator<_Ref, _Val, _Allocator>::__iterator {
-public:
-  using value_type      = __value_t;
-  using difference_type = ptrdiff_t;
-
-  __iterator(__iterator&& __other) noexcept : __coroutine_(std::exchange(__other.__coroutine_, {})) {}
-
-  __iterator& operator=(__iterator&& __other) noexcept {
-    __coroutine_ = std::exchange(__other.__coroutine_, {});
-    return *this;
-  }
-
-  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __reference_t operator*() const
-      noexcept(is_nothrow_copy_constructible_v<__reference_t>);
-
-  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __iterator& operator++();
-
-  _LIBCPP_HIDE_FROM_ABI void operator++(int) { ++*this; }
-
-  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI bool operator==(default_sentinel_t) { return __coroutine_.done(); }
-
-private:
-  coroutine_handle<promise_type> __coroutine_;
 };
 
 _LIBCPP_END_NAMESPACE_STD
