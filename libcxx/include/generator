@@ -12,6 +12,7 @@
 
 #include <__assert>
 #include <__concepts/constructible.h>
+#include <__concepts/convertible_to.h>
 #include <__config>
 #include <__coroutine/coroutine_handle.h>
 #include <__coroutine/noop_coroutine_handle.h>
@@ -19,7 +20,9 @@
 #include <__exception/exception_ptr.h>
 #include <__iterator/default_sentinel.h>
 #include <__memory/addressof.h>
+#include <__memory/allocator_arg_t.h>
 #include <__memory/allocator_traits.h>
+#include <__ranges/concepts.h>
 #include <__ranges/elements_of.h>
 #include <__ranges/view_interface.h>
 #include <__type_traits/add_pointer.h>
@@ -34,23 +37,6 @@
 #if _LIBCPP_STD_VER >= 23
 
 _LIBCPP_BEGIN_NAMESPACE_STD
-
-struct alignas(__STDCPP_DEFAULT_NEW_ALIGNMENT__) __aligned_block {
-  unsigned char data[__STDCPP_DEFAULT_NEW_ALIGNMENT__];
-};
-
-template <class _Allocator = void>
-class __coroutine_allocator {
-private:
-  using __alloc_t = __rebind_alloc<_Allocator, __aligned_block>::type;
-
-  static void* __allocate(__alloc_t __allocator, const size_t __size) {
-    if constexpr (default_initializable<__alloc_t> && allocator_traits<__alloc_t>::is_always_equal::value) {
-    }
-  }
-
-public:
-};
 
 template <class _Ref, class _Val>
 using __gen_val = conditional_t<is_void_v<_Val>, remove_cvref_t<_Ref>, _Val>;
@@ -68,8 +54,19 @@ class generator;
 template <class _Yielded>
 class __gen_promise_base {
 private:
+  template <class, class, class>
+  friend class generator;
+
+  // Each promise object stores either a `__root_data` when associated with a root generator, or a `__recursive_data`
+  // when associated with a generator that is yielded recursively.
   struct __root_data {
+    // The client code has access only to the iterator of the root generator. Thus, the root generator must store the
+    // yielded values of recursively-yielded generators, which will then be returned when the client code dereferences
+    // the iterator.
     add_pointer_t<_Yielded> __value_ptr;
+    // The client code has access only to the iterator of the root generator. Thus, the root generator needs to identify
+    // which generator is currently active. This active generator will then be resumed when the client code increments
+    // the iterator.
     std::coroutine_handle<__gen_promise_base> __active;
   };
 
@@ -82,25 +79,39 @@ private:
   union {
     __root_data __root;
     __recursive_data __recursive;
-  } __data_;
+  } __data_ = __root_data{
+      .__value_ptr = nullptr,
+      .__active    = coroutine_handle<__gen_promise_base>::from_promise(*this).address(),
+  };
+
+  // The `__tag_` stores the active member of the `__data_` union:
+  // - `false` indicates that the active member is `__root`.
+  // - `true` indicates that the active member is `__recursive`.
+  // This field can be omitted because `__recursive_data.__root` could only equal `nullptr` if the active member is
+  // `__root`.
   bool __tag_ = false;
 
   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI bool __is_root() noexcept { return !__tag_; }
   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __root_data* __get_root_data() noexcept {
-    _LIBCPP_ASSERT_INTERNAL(__is_root(), "todo");
-    return &__data_.__root;
+    _LIBCPP_ASSERT_INTERNAL(__is_root(), "the active member of `__data_` is not `__root`");
+    return std::addressof(__data_.__root);
   }
   _LIBCPP_HIDE_FROM_ABI void __set_root_tag() noexcept { __tag_ = false; }
 
   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI bool __is_recursive() noexcept { return __tag_; }
   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __recursive_data* __get_recursive_data() noexcept {
-    _LIBCPP_ASSERT_INTERNAL(__is_recursive(), "todo");
-    return &__data_.__recursive;
+    _LIBCPP_ASSERT_INTERNAL(__is_recursive(), "the active member of `__data_` is not `__recursive`");
+    return std::addressof(__data_.__recursive);
   }
   _LIBCPP_HIDE_FROM_ABI void __set_recursive_tag() noexcept { __tag_ = true; }
 
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI std::coroutine_handle<__gen_promise_base>& __active() noexcept {
+    _LIBCPP_ASSERT_INTERNAL(__is_root(), "the active member of `__data_` is not `__root`");
+    return __data_.__get_root_data().__active;
+  }
+
   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI add_pointer_t<_Yielded>& __value_ptr() noexcept {
-    _LIBCPP_ASSERT_INTERNAL(__is_root(), "todo");
+    _LIBCPP_ASSERT_INTERNAL(__is_root(), "the active member of `__data_` is not `__root`");
     return __data_.__get_root_data().__value_ptr;
   }
 
@@ -111,71 +122,77 @@ private:
     return __data_.__get_recursive_data().__root.promise().__value_ptr();
   }
 
-  class __element_awaiter {
-  public:
-    [[nodiscard]] constexpr bool await_ready() const noexcept { return false; }
+  struct __element_awaiter {
+    [[nodiscard]] _LIBCPP_HIDE_FROM_ABI bool await_ready() noexcept { return false; }
 
     template <class _Promise>
-    constexpr void await_suspend(coroutine_handle<_Promise> __current) noexcept {
-      __current.promise().__root_value_ptr() = std::addressof(__value_);
+    _LIBCPP_HIDE_FROM_ABI void await_suspend(coroutine_handle<_Promise> __current) noexcept {
+      __current.promise().__root_value_ptr() = std::addressof(__value);
     }
 
-    constexpr void await_resume() const noexcept {}
+    _LIBCPP_HIDE_FROM_ABI void await_resume() noexcept {}
 
-  private:
-    remove_cvref_t<_Yielded> __value_;
+    remove_cvref_t<_Yielded> __value;
   };
 
-  class __final_awaiter {
-  public:
-    [[nodiscard]] constexpr bool await_ready() const noexcept { return false; }
+  struct __final_awaiter {
+    [[nodiscard]] _LIBCPP_HIDE_FROM_ABI bool await_ready() noexcept { return false; }
 
     template <class _Promise>
-    constexpr coroutine_handle<> await_suspend(coroutine_handle<_Promise> __current) noexcept {
+    _LIBCPP_HIDE_FROM_ABI coroutine_handle<> await_suspend(coroutine_handle<_Promise> __current) noexcept {
+      // Checks if the current generator is recursively-yielded
       if (__current.promise().__is_recursive()) {
         auto __recursive_data = __current.promise().__get_recursive_data();
         auto __parent         = __recursive_data.__parent;
-        auto __root_data      = __recursive_data.__root.promise().__get_root_data();
-        __root_data.__active  = __parent;
+        // Updates the active generator to its parent, allowing the client code to resume it later
+        __recursive_data.__root.promise().__active() = __parent;
+        // Transfers execution to its parent, which is the generator that yields it
         return __parent;
       }
       return std::noop_coroutine();
     }
 
-    constexpr void await_resume() const noexcept {}
+    _LIBCPP_HIDE_FROM_ABI void await_resume() noexcept {}
   };
 
   template <class _Ref, class _Val, class _Allocator>
-  class __nested_awaiter {
-  private:
-    generator<_Ref, _Val, _Allocator> __gen_;
+  struct __recursive_awaiter {
+    generator<_Ref, _Val, _Allocator> __gen;
 
-  public:
-    explicit __nested_awaiter(generator<_Ref, _Val, _Allocator>&& __gen) noexcept : __gen_(std::move(__gen)) {}
+    _LIBCPP_HIDE_FROM_ABI explicit __recursive_awaiter(generator<_Ref, _Val, _Allocator>&& __gen) noexcept
+        : __gen(std::move(__gen)) {}
 
-    [[nodiscard]] constexpr bool await_ready() const noexcept { return !__gen_.__coroutine_; }
+    [[nodiscard]] _LIBCPP_HIDE_FROM_ABI bool await_ready() noexcept { return !__gen.__coroutine_; }
 
     template <class _Promise>
-    constexpr coroutine_handle<__gen_promise_base> await_suspend(coroutine_handle<_Promise> __current) noexcept {
-      auto __recursive = coroutine_handle<__gen_promise_base>::from_address(__gen_.__coroutine_.address());
+    _LIBCPP_HIDE_FROM_ABI coroutine_handle<__gen_promise_base>
+    await_suspend(coroutine_handle<_Promise> __current) noexcept {
+      // Stores a `__recursive_data` in the promise object associated with `__gen`
+      auto __recursive = coroutine_handle<__gen_promise_base>::from_address(__gen.__coroutine_.address());
       __recursive.promise().__set_recursive_tag();
       auto __recursive_data = __recursive.promise().__get_recursive_data();
 
+      // Sets `__recursive_data.__parent` to the current generator
       auto __parent              = coroutine_handle<__gen_promise_base>::from_address(__current.address());
       __recursive_data.__parent_ = __parent;
+
+      // Sets `__recursive_data.__root` to the current generator if it's a root generator, or to the root generator of
+      // the current generator otherwise
       if (__parent.__is_recursive()) {
         __recursive_data.__root = __parent.promise().__get_recursive_data().__root;
       } else {
         __recursive_data.__root = __parent;
       }
 
-      auto __root_data     = __recursive_data.__root.promise().__get_root_data();
-      __root_data.__active = __recursive;
+      // Updates the active generator to `__gen`, allowing the client code to resume it later
+      __recursive_data.__root.promise().__active() = __recursive;
+
+      // Transfers execution to `__gen`
       return __recursive;
     }
 
-    void await_resume() {
-      auto __recursive      = coroutine_handle<__gen_promise_base>::from_address(__gen_.__coroutine_.address());
+    _LIBCPP_HIDE_FROM_ABI void await_resume() {
+      auto __recursive      = coroutine_handle<__gen_promise_base>::from_address(__gen.__coroutine_.address());
       auto __recursive_data = __recursive.promise().__get_recursive_data();
       if (__recursive_data.__exception) {
         std::rethrow_exception(std::move(__recursive_data.__exception));
@@ -184,27 +201,48 @@ private:
   };
 
 public:
-  suspend_always initial_suspend() const noexcept { return {}; }
+  _LIBCPP_HIDE_FROM_ABI suspend_always initial_suspend() const noexcept { return {}; }
 
-  auto final_suspend() noexcept { return __final_awaiter{}; }
+  _LIBCPP_HIDE_FROM_ABI __final_awaiter final_suspend() noexcept { return {}; }
 
-  suspend_always yield_value(_Yielded __val) noexcept {
-    __root_value_ptr() = addressof(__val);
+  _LIBCPP_HIDE_FROM_ABI suspend_always yield_value(_Yielded __value) noexcept {
+    __root_value_ptr() = addressof(__value);
     return {};
   }
 
-  auto yield_value(const remove_reference_t<_Yielded>& __val)
+  _LIBCPP_HIDE_FROM_ABI auto yield_value(const remove_reference_t<_Yielded>& __value)
     requires is_rvalue_reference_v<_Yielded> &&
              constructible_from<remove_cvref_t<_Yielded>, const remove_reference_t<_Yielded>&>
   {
-    return __element_awaiter(__val);
+    return __element_awaiter{.__value = __value};
   }
 
-  void await_transform() = delete;
+  template <class _Ref2, class _Val2, class _Allocator2, class _Unused>
+    requires same_as<__gen_yielded<_Ref2, _Val2>, _Yielded>
+  _LIBCPP_HIDE_FROM_ABI auto
+  yield_value(ranges::elements_of<generator<_Ref2, _Val2, _Allocator2>&&, _Unused> __elements) noexcept {
+    return __recursive_awaiter{std::move(__elements.range)};
+  }
 
-  void return_void() const noexcept {}
+  template <ranges::input_range _Range, class _Allocator>
+    requires convertible_to<ranges::range_reference_t<_Range>, _Yielded>
+  _LIBCPP_HIDE_FROM_ABI auto yield_value(ranges::elements_of<_Range, _Allocator> __range) {
+    auto __lambda =
+        [](allocator_arg_t, _Allocator, ranges::iterator_t<_Range> __i, ranges::sentinel_t<_Range> __s) static
+        -> generator<_Yielded, ranges::range_value_t<_Range>, _Allocator> {
+      for (; __i != __s; ++__i) {
+        co_yield static_cast<_Yielded>(*__i);
+      }
+    };
+    return yield_value(ranges::elements_of(
+        __lambda(allocator_arg, __range.allocator, ranges::begin(__range.range), ranges::end(__range.range))));
+  }
 
-  void unhandled_exception() {
+  _LIBCPP_HIDE_FROM_ABI void await_transform() = delete;
+
+  _LIBCPP_HIDE_FROM_ABI void return_void() const noexcept {}
+
+  _LIBCPP_HIDE_FROM_ABI void unhandled_exception() {
     if (__is_root()) {
       throw;
     } else {
@@ -224,21 +262,21 @@ public:
   using value_type      = __val;
   using difference_type = ptrdiff_t;
 
-  struct promise_type {};
+  _LIBCPP_HIDE_FROM_ABI __gen_iter(__gen_iter&& __other) noexcept
+      : __coroutine_(std::exchange(__other.__coroutine_, {})) {}
 
-  __gen_iter(__gen_iter&& __other) noexcept : __coroutine_(std::exchange(__other.__coroutine_, {})) {}
-
-  __gen_iter& operator=(__gen_iter&& __other) noexcept {
+  _LIBCPP_HIDE_FROM_ABI __gen_iter& operator=(__gen_iter&& __other) noexcept {
     __coroutine_ = std::exchange(__other.__coroutine_, {});
     return *this;
   }
 
   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __ref operator*() const noexcept(is_nothrow_copy_constructible_v<__ref>) {
-    // todo: return static_cast<__reference_t>();
+    return static_cast<__ref>(__coroutine_.promise().__value_ptr());
   }
 
   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __gen_iter& operator++() {
-    // todo
+    __coroutine_.promise().__active().resume();
+    return *this;
   }
 
   _LIBCPP_HIDE_FROM_ABI void operator++(int) { ++*this; }
@@ -246,25 +284,30 @@ public:
   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI bool operator==(default_sentinel_t) { return __coroutine_.done(); }
 
 private:
-  _LIBCPP_HIDE_FROM_ABI explicit __gen_iter(coroutine_handle<promise_type> __coroutine) noexcept
+  template <class, class, class>
+  friend class generator;
+
+  _LIBCPP_HIDE_FROM_ABI explicit __gen_iter(
+      coroutine_handle<__gen_promise_base<__gen_yielded<_Ref, _Val>>> __coroutine) noexcept
       : __coroutine_(std::move(__coroutine)) {}
 
-  coroutine_handle<promise_type> __coroutine_;
+  coroutine_handle<__gen_promise_base<__gen_yielded<_Ref, _Val>>> __coroutine_;
 };
 
 template <class _Ref, class _Val = void, class _Allocator = void>
 class generator : public ranges::view_interface<generator<_Ref, _Val, _Allocator>> {
 private:
   using __val = __gen_val<_Ref, _Val>;
-
   using __ref = __gen_ref<_Ref, _Val>;
-
-  friend __gen_iter<_Ref, _Val>;
 
 public:
   using yielded = __gen_yielded<_Ref, _Val>;
 
-  class promise_type;
+  struct promise_type : __gen_promise_base<yielded> {
+    [[nodiscard]] _LIBCPP_HIDE_FROM_ABI generator get_return_object() noexcept {
+      return generator{coroutine_handle<promise_type>::from_promise(*this)};
+    }
+  };
 
   _LIBCPP_HIDE_FROM_ABI generator(const generator&) = delete;
   _LIBCPP_HIDE_FROM_ABI generator(generator&& __other) noexcept
@@ -283,12 +326,15 @@ public:
 
   [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __gen_iter<_Ref, _Val> begin() {
     __coroutine_.resume();
-    return __gen_iter(__coroutine_);
+    return {__coroutine_};
   }
 
-  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI default_sentinel_t end() const noexcept { return default_sentinel; }
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI default_sentinel_t end() const noexcept { return {}; }
 
 private:
+  _LIBCPP_HIDE_FROM_ABI explicit generator(coroutine_handle<promise_type> __coroutine) noexcept
+      : __coroutine_(__coroutine) {}
+
   coroutine_handle<promise_type> __coroutine_ = nullptr;
 };
 
