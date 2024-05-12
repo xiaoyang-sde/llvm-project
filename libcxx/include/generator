@@ -10,9 +10,11 @@
 #ifndef _LIBCPP_GENERATOR
 #define _LIBCPP_GENERATOR
 
+#include <__assert>
 #include <__concepts/constructible.h>
 #include <__config>
 #include <__coroutine/coroutine_handle.h>
+#include <__coroutine/noop_coroutine_handle.h>
 #include <__coroutine/trivial_awaitables.h>
 #include <__exception/exception_ptr.h>
 #include <__iterator/default_sentinel.h>
@@ -28,9 +30,6 @@
 #include <__type_traits/remove_cvref.h>
 #include <__utility/exchange.h>
 #include <__utility/swap.h>
-#include <coroutine>
-#include <exception>
-#include <variant>
 
 #if _LIBCPP_STD_VER >= 23
 
@@ -69,44 +68,56 @@ class generator;
 template <class _Yielded>
 class __gen_promise_base {
 private:
-  // todo(delete me): root <-> nested <-> nested
-  // outmost gen yield nested gen yield nested gen
-  // outmost gen promise should know inner-most gen, so ++iter can resume the inner-most gen directly
-  // inner-most gen should know parent gen, so it can resume parent gen when it final_await
-  // inner-most gen should know root gen, so it can resume root gen when it yield_value, because *iter access the
-  // inner-most gen
-
-  // root: value, active
-  // nested: parent, bottom, exception
-
-  struct __promise_data;
-
-  class __root_frame {
-    add_pointer_t<_Yielded> __value_ptr_ = nullptr;
-    std::coroutine_handle<__gen_promise_base> __active_coroutine_ =
-        coroutine_handle<__gen_promise_base>::from_promise(*this);
+  struct __root_data {
+    add_pointer_t<_Yielded> __value_ptr;
+    std::coroutine_handle<__gen_promise_base> __active;
   };
 
-  class __nested_frame {
-    std::coroutine_handle<__gen_promise_base> __parent_coroutine_;
-    std::coroutine_handle<__gen_promise_base> __root_coroutine_;
-    std::exception_ptr __exception_;
+  struct __recursive_data {
+    std::exception_ptr __exception;
+    std::coroutine_handle<__gen_promise_base> __parent;
+    std::coroutine_handle<__gen_promise_base> __root;
   };
 
-  std::variant<__root_frame, __nested_frame> __frame_state_;
+  union {
+    __root_data __root;
+    __recursive_data __recursive;
+  } __data_;
+  bool __tag_ = false;
 
-  __root_frame* __get_root_frame() { return std::get_if<__root_frame>(__frame_state_); }
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI bool __is_root() noexcept { return !__tag_; }
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __root_data* __get_root_data() noexcept {
+    _LIBCPP_ASSERT_INTERNAL(__is_root(), "todo");
+    return &__data_.__root;
+  }
+  _LIBCPP_HIDE_FROM_ABI void __set_root_tag() noexcept { __tag_ = false; }
 
-  __nested_frame* __get_nested_frame() { return std::get_if<__nested_frame>(__frame_state_); }
-  void __set_nested_frame() { __frame_state_ = __nested_frame{}; }
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI bool __is_recursive() noexcept { return __tag_; }
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __recursive_data* __get_recursive_data() noexcept {
+    _LIBCPP_ASSERT_INTERNAL(__is_recursive(), "todo");
+    return &__data_.__recursive;
+  }
+  _LIBCPP_HIDE_FROM_ABI void __set_recursive_tag() noexcept { __tag_ = true; }
+
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI add_pointer_t<_Yielded>& __value_ptr() noexcept {
+    _LIBCPP_ASSERT_INTERNAL(__is_root(), "todo");
+    return __data_.__get_root_data().__value_ptr;
+  }
+
+  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI add_pointer_t<_Yielded>& __root_value_ptr() noexcept {
+    if (__data_.__is_root()) {
+      return __value_ptr();
+    }
+    return __data_.__get_recursive_data().__root.promise().__value_ptr();
+  }
 
   class __element_awaiter {
   public:
     [[nodiscard]] constexpr bool await_ready() const noexcept { return false; }
 
     template <class _Promise>
-    constexpr void await_suspend(coroutine_handle<_Promise> __handle) noexcept {
-      __handle.promise().__value_ptr_ = std::addressof(__value_);
+    constexpr void await_suspend(coroutine_handle<_Promise> __current) noexcept {
+      __current.promise().__root_value_ptr() = std::addressof(__value_);
     }
 
     constexpr void await_resume() const noexcept {}
@@ -120,12 +131,13 @@ private:
     [[nodiscard]] constexpr bool await_ready() const noexcept { return false; }
 
     template <class _Promise>
-    constexpr coroutine_handle<> await_suspend(coroutine_handle<_Promise> __handle) noexcept {
-      if (auto __nested_frame = __handle.promise().__get_nested_frame()) {
-        auto __parent_coroutine          = __nested_frame.__parent_coroutine_;
-        auto __root_frame                = __nested_frame.__root_coroutine_.promise().__get_root_frame();
-        __root_frame.__active_coroutine_ = __parent_coroutine;
-        return __parent_coroutine;
+    constexpr coroutine_handle<> await_suspend(coroutine_handle<_Promise> __current) noexcept {
+      if (__current.promise().__is_recursive()) {
+        auto __recursive_data = __current.promise().__get_recursive_data();
+        auto __parent         = __recursive_data.__parent;
+        auto __root_data      = __recursive_data.__root.promise().__get_root_data();
+        __root_data.__active  = __parent;
+        return __parent;
       }
       return std::noop_coroutine();
     }
@@ -145,28 +157,28 @@ private:
 
     template <class _Promise>
     constexpr coroutine_handle<__gen_promise_base> await_suspend(coroutine_handle<_Promise> __current) noexcept {
-      auto __nested = coroutine_handle<__gen_promise_base>::from_address(__gen_.__coroutine_.address());
-      __nested.__set_nested_frame();
+      auto __recursive = coroutine_handle<__gen_promise_base>::from_address(__gen_.__coroutine_.address());
+      __recursive.promise().__set_recursive_tag();
+      auto __recursive_data = __recursive.promise().__get_recursive_data();
 
-      auto __nested_frame                = __nested.promise().__get_nested_frame();
-      __nested_frame.__parent_coroutine_ = coroutine_handle<__gen_promise_base>::from_address(__current.address());
-      if (auto __parent_nested_frame = __nested_frame.__parent_coroutine_.promise().__get_nested_frame()) {
-        __nested_frame.__root_coroutine_ = __parent_nested_frame.__root_coroutine_;
+      auto __parent              = coroutine_handle<__gen_promise_base>::from_address(__current.address());
+      __recursive_data.__parent_ = __parent;
+      if (__parent.__is_recursive()) {
+        __recursive_data.__root = __parent.promise().__get_recursive_data().__root;
       } else {
-        __nested_frame.__root_coroutine_ = __nested_frame.__parent_coroutine_;
+        __recursive_data.__root = __parent;
       }
 
-      auto __root_frame                = __nested_frame.__root_coroutine_.promise().__get_root_frame();
-      __root_frame.__active_coroutine_ = __nested;
-
-      return __nested;
+      auto __root_data     = __recursive_data.__root.promise().__get_root_data();
+      __root_data.__active = __recursive;
+      return __recursive;
     }
 
     void await_resume() {
-      auto __nested       = coroutine_handle<__gen_promise_base>::from_address(__gen_.__coroutine_.address());
-      auto __nested_frame = __nested.promise().__get_nested_frame();
-      if (__nested_frame.__exception_) {
-        std::rethrow_exception(std::move(__nested_frame.__exception_));
+      auto __recursive      = coroutine_handle<__gen_promise_base>::from_address(__gen_.__coroutine_.address());
+      auto __recursive_data = __recursive.promise().__get_recursive_data();
+      if (__recursive_data.__exception) {
+        std::rethrow_exception(std::move(__recursive_data.__exception));
       }
     }
   };
@@ -177,7 +189,7 @@ public:
   auto final_suspend() noexcept { return __final_awaiter{}; }
 
   suspend_always yield_value(_Yielded __val) noexcept {
-    std::get_if<__root_frame>(__frame_state_)->__value_ptr = addressof(__val);
+    __root_value_ptr() = addressof(__val);
     return {};
   }
 
@@ -193,58 +205,13 @@ public:
   void return_void() const noexcept {}
 
   void unhandled_exception() {
-    if (auto __nested_frame = __get_nested_frame()) {
-      __nested_frame.exception_ptr = std::current_exception();
-    } else {
+    if (__is_root()) {
       throw;
+    } else {
+      auto __recursive_data         = __get_recursive_data();
+      __recursive_data->__exception = std::current_exception();
     }
   }
-};
-
-template <class _Yielded>
-struct __gen_promise_base<_Yielded>::__promise_data {
-  using __value_ptr_t = add_pointer_t<_Yielded>;
-
-  struct __root_data {
-    __value_ptr_t __value_ptr;
-    std::coroutine_handle<__gen_promise_base> __active;
-  };
-
-  struct __recursive_data {
-    std::exception_ptr __exception;
-    std::coroutine_handle<__gen_promise_base> __parent;
-    std::coroutine_handle<__gen_promise_base> __root;
-  };
-
-  union {
-    __root_data __root;
-    __recursive_data __recursive;
-  } __data;
-  bool __tag = false;
-
-  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI bool __is_root() noexcept { return !__tag; }
-  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI bool __is_recursive() noexcept { return __tag; }
-
-  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __root_data* __get_root_data() noexcept {
-    // assert(__is_root());
-    return __data.__root;
-  }
-
-  [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __root_data* __get_recursive_data() noexcept {
-    // assert(__is_recursive());
-    return __data.__recursive;
-  }
-
-  // [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __value_ptr_t& __value_ptr() noexcept {
-  //   return __data.__root.__value_ptr;
-  // }
-
-  // [[nodiscard]] _LIBCPP_HIDE_FROM_ABI __value_ptr_t& __root_value_ptr() noexcept {
-  //   if (__is_root()) {
-
-  //   }
-  //   return __data.__recursive.__root.promise().__data.__root.__value_ptr;
-  // }
 };
 
 template <class _Ref, class _Val>
