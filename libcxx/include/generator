@@ -27,8 +27,10 @@
 #include <__ranges/elements_of.h>
 #include <__ranges/view_interface.h>
 #include <__type_traits/add_pointer.h>
+#include <__type_traits/common_reference.h>
 #include <__type_traits/conditional.h>
 #include <__type_traits/is_nothrow_constructible.h>
+#include <__type_traits/is_object.h>
 #include <__type_traits/is_reference.h>
 #include <__type_traits/is_void.h>
 #include <__type_traits/remove_cvref.h>
@@ -312,7 +314,15 @@ template <class _Ref, class _Val = void, class _Allocator = void>
 class generator : public ranges::view_interface<generator<_Ref, _Val, _Allocator>> {
 private:
   using __val = __gen_val<_Ref, _Val>;
+  static_assert(same_as<remove_cvref_t<__val>, __val> && is_object_v<__val>);
+
   using __ref = __gen_ref<_Ref, _Val>;
+  static_assert(is_reference_v<__ref> ||
+                (same_as<remove_cvref_t<__ref>, __ref> && is_object_v<__ref> && copy_constructible<__ref>));
+
+  using __rref = conditional_t<is_lvalue_reference_v<_Ref>, remove_reference_t<_Ref>&&, _Ref>;
+  static_assert(common_reference_with<__ref&&, __val&> && common_reference_with<__ref&&, __rref&&> &&
+                common_reference_with<__rref&&, const __val&>);
 
   template <class>
   friend class __gen_promise_base;
